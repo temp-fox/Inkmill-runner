@@ -171,7 +171,7 @@ def _commit_and_push(payload: dict[str, str], status: str, failed_stage: str | N
 
     message_status = 'completed' if status == 'success' else f'failed at {failed_stage}'
     _require_success(
-        _run('git-commit', ['git', 'commit', '-m', f'chore: record runner pipeline {message_status} [skip ci]'], cwd=PRIVATE_DIR, secrets=secrets),
+        _run('git-commit', ['git', 'commit', '-m', f'chore: record runner pipeline {message_status}'], cwd=PRIVATE_DIR, secrets=secrets),
         'git-commit',
     )
     _require_success(
