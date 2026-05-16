@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -34,6 +35,43 @@ def _write_log(name: str, content: str, *, secrets: list[str]) -> None:
     (TEMP_LOG_DIR / name).write_text(_sanitize(content, secrets), encoding='utf-8', errors='replace')
 
 
+def _write_json_log(name: str, payload: dict[str, object], *, secrets: list[str]) -> None:
+    _write_log(name, json.dumps(payload, ensure_ascii=False, indent=2, default=str), secrets=secrets)
+
+
+def _now_beijing() -> str:
+    return datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(timespec='seconds')
+
+
+def _provider_summary(raw: str) -> list[dict[str, object]]:
+    try:
+        providers = json.loads(raw or '[]')
+    except json.JSONDecodeError:
+        return [{'error': 'invalid provider json'}]
+    if not isinstance(providers, list):
+        return [{'error': 'provider json is not a list'}]
+    summary: list[dict[str, object]] = []
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        summary.append({
+            'name': provider.get('name'),
+            'type': provider.get('type'),
+            'model': provider.get('model'),
+            'priority': provider.get('priority'),
+            'enabled': provider.get('enabled'),
+            'timeout_seconds': provider.get('timeout_seconds'),
+            'max_turns': provider.get('max_turns'),
+        })
+    return summary
+
+
+def _file_info(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {'path': str(path), 'exists': False}
+    return {'path': str(path), 'exists': True, 'size_bytes': path.stat().st_size}
+
+
 def _run(
     name: str,
     args: list[str],
@@ -46,6 +84,8 @@ def _run(
     merged_env = os.environ.copy()
     if env:
         merged_env.update(env)
+    started_at = _now_beijing()
+    started = time.monotonic()
     completed = subprocess.run(
         args,
         cwd=cwd,
@@ -56,6 +96,8 @@ def _run(
         capture_output=True,
         check=False,
     )
+    duration_seconds = round(time.monotonic() - started, 3)
+    completed_at = _now_beijing()
     if stdout_file is not None and completed.stdout:
         stdout_file.write_text(completed.stdout, encoding='utf-8')
         stdout_text = f'[stdout written to {stdout_file.name}]\n'
@@ -66,6 +108,12 @@ def _run(
         f'cwd={cwd or WORKSPACE}',
         f'command={json.dumps(args, ensure_ascii=False)}',
         f'returncode={completed.returncode}',
+        f'started_at_beijing={started_at}',
+        f'completed_at_beijing={completed_at}',
+        f'duration_seconds={duration_seconds}',
+        f'env_override_keys={json.dumps(sorted((env or {}).keys()), ensure_ascii=False)}',
+        f'stdout_chars={len(completed.stdout or "")}',
+        f'stderr_chars={len(completed.stderr or "")}',
         '--- stdout ---',
         stdout_text,
         '--- stderr ---',
@@ -126,6 +174,90 @@ def _checkout_private(payload: dict[str, str], secrets: list[str]) -> None:
     _require_success(completed, 'checkout')
     completed = _run('set-remote', ['git', 'remote', 'set-url', 'origin', repo_url], cwd=PRIVATE_DIR, secrets=secrets + [repo_url])
     _require_success(completed, 'set-remote')
+    _write_checkout_summary(payload, secrets)
+
+
+def _git_output(args: list[str], *, cwd: Path) -> str:
+    completed = subprocess.run(args, cwd=cwd, text=True, encoding='utf-8', errors='replace', capture_output=True, check=False)
+    return completed.stdout.strip() if completed.returncode == 0 else ''
+
+
+def _write_checkout_summary(payload: dict[str, str], secrets: list[str]) -> None:
+    _write_json_log('checkout-summary.log', {
+        'private_repository': payload.get('private_repository'),
+        'private_ref': payload.get('private_ref'),
+        'head_sha': _git_output(['git', 'rev-parse', 'HEAD'], cwd=PRIVATE_DIR),
+        'head_subject': _git_output(['git', 'log', '-1', '--format=%s'], cwd=PRIVATE_DIR),
+        'tracked_files': len(_git_output(['git', 'ls-files'], cwd=PRIVATE_DIR).splitlines()),
+        'created_at_beijing': _now_beijing(),
+    }, secrets=secrets)
+
+
+def _write_environment_summary(payload: dict[str, str], secrets: list[str]) -> None:
+    _write_json_log('environment-summary.log', {
+        'runner_run_id': os.environ.get('GITHUB_RUN_ID'),
+        'runner_repository': os.environ.get('GITHUB_REPOSITORY'),
+        'upstream_run_id': payload.get('upstream_run_id'),
+        'autoaction': payload.get('autoaction'),
+        'article_type': payload.get('article_type'),
+        'pythonioencoding': os.environ.get('PYTHONIOENCODING'),
+        'timezone': os.environ.get('TZ'),
+        'claude_providers': _provider_summary(os.environ.get('CLAUDE_PROVIDERS_JSON', '')),
+        'image_providers': _provider_summary(os.environ.get('IMAGE_PROVIDERS_JSON', '')),
+        'created_at_beijing': _now_beijing(),
+    }, secrets=secrets)
+
+
+def _write_prompt_summary(index: int, prompt_file: Path, secrets: list[str]) -> None:
+    payload: dict[str, object] = {'index': index, 'prompt_file': _file_info(prompt_file), 'created_at_beijing': _now_beijing()}
+    try:
+        prompt_payload = json.loads(prompt_file.read_text(encoding='utf-8'))
+        prompt_text = str(prompt_payload.get('prompt') or '') if isinstance(prompt_payload, dict) else ''
+        payload.update({
+            'topic': prompt_payload.get('topic') if isinstance(prompt_payload, dict) else None,
+            'article_type': prompt_payload.get('article_type') if isinstance(prompt_payload, dict) else None,
+            'additional_requirements': prompt_payload.get('additional_requirements') if isinstance(prompt_payload, dict) else None,
+            'warnings': prompt_payload.get('warnings') if isinstance(prompt_payload, dict) else None,
+            'prompt_chars': len(prompt_text),
+            'has_health_food_skill': 'skills/HealthFoodSkill' in prompt_text,
+            'has_article_skill_context': '## skills/ArticleSkill/' in prompt_text,
+            'has_image_planning': '配图规划' in prompt_text and 'image_slots' in prompt_text,
+        })
+    except Exception as exc:
+        payload['error'] = repr(exc)
+    _write_json_log(f'prompt-summary-{index}.log', payload, secrets=secrets)
+
+
+def _write_response_summary(index: int, response_file: Path, secrets: list[str]) -> None:
+    payload: dict[str, object] = {'index': index, 'response_file': _file_info(response_file), 'created_at_beijing': _now_beijing()}
+    try:
+        response = json.loads(response_file.read_text(encoding='utf-8'))
+        image_slots = response.get('image_slots', []) if isinstance(response, dict) else []
+        payload.update({
+            'title': response.get('title') if isinstance(response, dict) else None,
+            'article_type': response.get('article_type') if isinstance(response, dict) else None,
+            'summary': response.get('summary') if isinstance(response, dict) else None,
+            'word_count': response.get('word_count') if isinstance(response, dict) else None,
+            'hot_topics': response.get('hot_topics') if isinstance(response, dict) else None,
+            'reference_count': len(response.get('references', [])) if isinstance(response.get('references', []), list) else None,
+            'image_slot_count': len(image_slots) if isinstance(image_slots, list) else None,
+            'image_slot_alts': [slot.get('alt') for slot in image_slots if isinstance(slot, dict)] if isinstance(image_slots, list) else None,
+            'markdown_chars': len(str(response.get('markdown_body') or '')) if isinstance(response, dict) else None,
+        })
+    except Exception as exc:
+        payload['error'] = repr(exc)
+    _write_json_log(f'response-summary-{index}.log', payload, secrets=secrets)
+
+
+def _write_private_status_summary(name: str, secrets: list[str]) -> None:
+    _write_json_log(f'{name}.log', {
+        'head_sha': _git_output(['git', 'rev-parse', 'HEAD'], cwd=PRIVATE_DIR),
+        'status_short': _git_output(['git', 'status', '--short'], cwd=PRIVATE_DIR).splitlines(),
+        'latest_articles': _git_output(['git', 'ls-files', 'articles'], cwd=PRIVATE_DIR).splitlines()[-20:],
+        'usage_file': _file_info(PRIVATE_DIR / 'state' / 'usage.json'),
+        'site_data_file': _file_info(PRIVATE_DIR / 'site' / 'data' / 'articles.json'),
+        'created_at_beijing': _now_beijing(),
+    }, secrets=secrets)
 
 
 def _copy_logs_to_private(payload: dict[str, str], status: str, failed_stage: str | None, secrets: list[str]) -> Path | None:
@@ -138,6 +270,7 @@ def _copy_logs_to_private(payload: dict[str, str], status: str, failed_stage: st
     if TEMP_LOG_DIR.exists():
         for source in TEMP_LOG_DIR.glob('*.log'):
             shutil.copy2(source, log_dir / source.name)
+    log_files = sorted(path.name for path in log_dir.glob('*.log'))
     summary = {
         'status': status,
         'failed_stage': failed_stage,
@@ -145,6 +278,8 @@ def _copy_logs_to_private(payload: dict[str, str], status: str, failed_stage: st
         'upstream_run_id': payload.get('upstream_run_id'),
         'autoaction': payload.get('autoaction'),
         'private_ref': payload.get('private_ref'),
+        'log_file_count': len(log_files),
+        'log_files': log_files,
         'created_at_beijing': datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(timespec='seconds'),
     }
     (log_dir / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -191,6 +326,7 @@ def _run_pipeline(payload: dict[str, str], secrets: list[str]) -> None:
         'PYTHONIOENCODING': 'utf-8',
         'TZ': 'Asia/Shanghai',
     }
+    _write_environment_summary(payload, secrets)
     _require_success(_run('install-claude-cli', ['npm', 'install', '-g', '@anthropic-ai/claude-code'], secrets=secrets), 'install-claude-cli')
     _require_success(_run('claude-version', ['claude', '--version'], secrets=secrets), 'claude-version')
     _require_success(_run('uv-sync', ['uv', 'sync'], cwd=PRIVATE_DIR, secrets=secrets), 'uv-sync')
@@ -217,6 +353,7 @@ def _run_pipeline(payload: dict[str, str], secrets: list[str]) -> None:
             ),
             f'build-prompt-{index}',
         )
+        _write_prompt_summary(index, prompt_file, secrets)
         _require_success(
             _run(
                 f'generate-article-{index}',
@@ -227,6 +364,7 @@ def _run_pipeline(payload: dict[str, str], secrets: list[str]) -> None:
             ),
             f'generate-article-{index}',
         )
+        _write_response_summary(index, response_file, secrets)
         _require_success(
             _run(
                 f'persist-article-{index}',
@@ -239,6 +377,7 @@ def _run_pipeline(payload: dict[str, str], secrets: list[str]) -> None:
         )
 
     _require_success(_run('build-site-data', ['uv', 'run', 'python', 'scripts/build_site_data.py'], cwd=PRIVATE_DIR, env=env, secrets=secrets), 'build-site-data')
+    _write_private_status_summary('private-status-after-pipeline', secrets)
 
 
 def main() -> int:
@@ -269,11 +408,15 @@ def main() -> int:
     except PipelineError as exc:
         status = 'failure'
         failed_stage = str(exc)
+        if PRIVATE_DIR.exists():
+            _write_private_status_summary('private-status-after-failure', secrets)
         print(f'[runner] failed; stage={failed_stage}; private logs will be pushed when possible')
     except Exception as exc:
         status = 'failure'
         failed_stage = type(exc).__name__
         _write_log('unexpected-error.log', repr(exc), secrets=secrets)
+        if PRIVATE_DIR.exists():
+            _write_private_status_summary('private-status-after-failure', secrets)
         print('[runner] failed; private logs will be pushed when possible')
     try:
         if payload:
