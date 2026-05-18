@@ -138,6 +138,13 @@ def _load_payload() -> dict[str, str]:
     article_type = str(payload.get('article_type') or '养生食物型')
     additional_requirements = str(payload.get('additional_requirements') or '')
     content_skill = str(payload.get('content_skill') or '').strip()
+    raw_runs_config = payload.get('content_skill_runs_json')
+    if isinstance(raw_runs_config, str):
+        content_skill_runs_json = raw_runs_config.strip()
+    elif raw_runs_config:
+        content_skill_runs_json = json.dumps(raw_runs_config, ensure_ascii=False)
+    else:
+        content_skill_runs_json = ''
     iteration = str(payload.get('iteration') or '').strip()
     runs = str(payload.get('runs') or '').strip()
     upstream_run_id = str(payload.get('run_id') or '')
@@ -159,10 +166,47 @@ def _load_payload() -> dict[str, str]:
         'article_type': article_type,
         'additional_requirements': additional_requirements,
         'content_skill': content_skill,
+        'content_skill_runs_json': content_skill_runs_json,
         'iteration': iteration,
         'runs': runs,
         'upstream_run_id': upstream_run_id,
     }
+
+
+def _build_run_plan(payload: dict[str, str]) -> list[dict[str, str]]:
+    raw_config = payload.get('content_skill_runs_json', '').strip()
+    if raw_config:
+        try:
+            runs_config = json.loads(raw_config)
+        except json.JSONDecodeError as exc:
+            raise PipelineError('resolve-run-plan') from exc
+        if isinstance(runs_config, dict):
+            runs_config = [runs_config]
+        if not isinstance(runs_config, list) or not runs_config:
+            raise PipelineError('resolve-run-plan')
+
+        run_plan: list[dict[str, str]] = []
+        for index, item in enumerate(runs_config, 1):
+            if not isinstance(item, dict):
+                raise PipelineError('resolve-run-plan')
+            content_skill = str(item.get('skill') or item.get('content_skill') or '').strip()
+            if not content_skill:
+                raise PipelineError('resolve-run-plan')
+            try:
+                runs = int(item.get('runs', 1))
+            except (TypeError, ValueError) as exc:
+                raise PipelineError('resolve-run-plan') from exc
+            if runs < 1:
+                raise PipelineError('resolve-run-plan')
+            for iteration in range(1, runs + 1):
+                run_plan.append({'content_skill': content_skill, 'iteration': str(iteration), 'runs': str(runs)})
+        return run_plan
+
+    count = int(payload['autoaction'])
+    return [
+        {'content_skill': payload.get('content_skill', ''), 'iteration': str(index), 'runs': str(count)}
+        for index in range(1, count + 1)
+    ]
 
 
 def _checkout_private(payload: dict[str, str], secrets: list[str]) -> None:
@@ -207,6 +251,8 @@ def _write_environment_summary(payload: dict[str, str], secrets: list[str]) -> N
         'autoaction': payload.get('autoaction'),
         'article_type': payload.get('article_type'),
         'content_skill': payload.get('content_skill'),
+        'content_skill_runs_json': payload.get('content_skill_runs_json'),
+        'run_plan': _build_run_plan(payload),
         'iteration': payload.get('iteration'),
         'runs': payload.get('runs'),
         'pythonioencoding': os.environ.get('PYTHONIOENCODING'),
@@ -342,19 +388,21 @@ def _run_pipeline(payload: dict[str, str], secrets: list[str]) -> None:
     _require_success(_run('uv-sync', ['uv', 'sync'], cwd=PRIVATE_DIR, secrets=secrets), 'uv-sync')
     _require_success(_run('validate-config', ['uv', 'run', 'python', 'scripts/validate_config.py'], cwd=PRIVATE_DIR, env=env, secrets=secrets), 'validate-config')
 
-    count = int(payload['autoaction'])
-    for index in range(1, count + 1):
+    run_plan = _build_run_plan(payload)
+    for index, item in enumerate(run_plan, 1):
         prompt_file = PRIVATE_DIR / f'claude_prompt_{index}.json'
         response_file = PRIVATE_DIR / f'claude_response_{index}.json'
-        requirements = f'{payload["additional_requirements"]} 当前是今天自动批次第 {index} 篇，请尽量与今天前面的自动文章错开角度。'
+        content_skill = item['content_skill']
+        content_skill_label = content_skill or '默认内容包'
+        requirements = f'{payload["additional_requirements"]} 当前是内容包 {content_skill_label} 的自动批次第 {item["iteration"]}/{item["runs"]} 篇，请尽量与同内容包今天前面的自动文章错开角度。'
         build_prompt_args = [
             'uv', 'run', 'python', 'scripts/build_prompt.py',
             '--topic', payload['topic'],
             '--article-type', payload['article_type'],
             '--additional-requirements', requirements,
         ]
-        if payload['content_skill']:
-            build_prompt_args.extend(['--content-skill', payload['content_skill']])
+        if content_skill:
+            build_prompt_args.extend(['--content-skill', content_skill])
         _require_success(
             _run(
                 f'build-prompt-{index}',
@@ -414,6 +462,8 @@ def main() -> int:
             'article_type': payload['article_type'],
             'additional_requirements': payload['additional_requirements'],
             'content_skill': payload['content_skill'],
+            'content_skill_runs_json': payload['content_skill_runs_json'],
+            'run_plan': _build_run_plan(payload),
             'iteration': payload['iteration'],
             'runs': payload['runs'],
         }, ensure_ascii=False, indent=2), secrets=secrets)
