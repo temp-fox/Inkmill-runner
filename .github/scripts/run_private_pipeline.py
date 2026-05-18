@@ -137,6 +137,9 @@ def _load_payload() -> dict[str, str]:
     topic = str(payload.get('topic') or '')
     article_type = str(payload.get('article_type') or '养生食物型')
     additional_requirements = str(payload.get('additional_requirements') or '')
+    content_skill = str(payload.get('content_skill') or '').strip()
+    iteration = str(payload.get('iteration') or '').strip()
+    runs = str(payload.get('runs') or '').strip()
     upstream_run_id = str(payload.get('run_id') or '')
 
     if not private_repository or '/' not in private_repository:
@@ -155,6 +158,9 @@ def _load_payload() -> dict[str, str]:
         'topic': topic,
         'article_type': article_type,
         'additional_requirements': additional_requirements,
+        'content_skill': content_skill,
+        'iteration': iteration,
+        'runs': runs,
         'upstream_run_id': upstream_run_id,
     }
 
@@ -200,6 +206,9 @@ def _write_environment_summary(payload: dict[str, str], secrets: list[str]) -> N
         'upstream_run_id': payload.get('upstream_run_id'),
         'autoaction': payload.get('autoaction'),
         'article_type': payload.get('article_type'),
+        'content_skill': payload.get('content_skill'),
+        'iteration': payload.get('iteration'),
+        'runs': payload.get('runs'),
         'pythonioencoding': os.environ.get('PYTHONIOENCODING'),
         'timezone': os.environ.get('TZ'),
         'claude_providers': _provider_summary(os.environ.get('CLAUDE_PROVIDERS_JSON', '')),
@@ -220,6 +229,7 @@ def _write_prompt_summary(index: int, prompt_file: Path, secrets: list[str]) -> 
             'warnings': prompt_payload.get('warnings') if isinstance(prompt_payload, dict) else None,
             'prompt_chars': len(prompt_text),
             'has_health_food_skill': 'skills/HealthFoodSkill' in prompt_text,
+            'has_health_food_list_skill': 'skills/HealthFoodListSkill' in prompt_text,
             'has_article_skill_context': '## skills/ArticleSkill/' in prompt_text,
             'has_image_planning': '配图规划' in prompt_text and 'image_slots' in prompt_text,
         })
@@ -337,15 +347,18 @@ def _run_pipeline(payload: dict[str, str], secrets: list[str]) -> None:
         prompt_file = PRIVATE_DIR / f'claude_prompt_{index}.json'
         response_file = PRIVATE_DIR / f'claude_response_{index}.json'
         requirements = f'{payload["additional_requirements"]} 当前是今天自动批次第 {index} 篇，请尽量与今天前面的自动文章错开角度。'
+        build_prompt_args = [
+            'uv', 'run', 'python', 'scripts/build_prompt.py',
+            '--topic', payload['topic'],
+            '--article-type', payload['article_type'],
+            '--additional-requirements', requirements,
+        ]
+        if payload['content_skill']:
+            build_prompt_args.extend(['--content-skill', payload['content_skill']])
         _require_success(
             _run(
                 f'build-prompt-{index}',
-                [
-                    'uv', 'run', 'python', 'scripts/build_prompt.py',
-                    '--topic', payload['topic'],
-                    '--article-type', payload['article_type'],
-                    '--additional-requirements', requirements,
-                ],
+                build_prompt_args,
                 cwd=PRIVATE_DIR,
                 env=env,
                 secrets=secrets,
@@ -400,6 +413,9 @@ def main() -> int:
             'topic': payload['topic'],
             'article_type': payload['article_type'],
             'additional_requirements': payload['additional_requirements'],
+            'content_skill': payload['content_skill'],
+            'iteration': payload['iteration'],
+            'runs': payload['runs'],
         }, ensure_ascii=False, indent=2), secrets=secrets)
         _checkout_private(payload, secrets)
         print('[runner] workspace ready')
