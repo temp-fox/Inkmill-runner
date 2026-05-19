@@ -436,8 +436,17 @@ def _run_pipeline(payload: dict[str, str], secrets: list[str]) -> None:
             ),
             f'persist-article-{index}',
         )
+        _require_success(
+            _run(
+                f'build-site-data-{index}',
+                ['uv', 'run', 'python', 'scripts/build_site_data.py'],
+                cwd=PRIVATE_DIR,
+                env=env,
+                secrets=secrets,
+            ),
+            f'build-site-data-{index}',
+        )
 
-    _require_success(_run('build-site-data', ['uv', 'run', 'python', 'scripts/build_site_data.py'], cwd=PRIVATE_DIR, env=env, secrets=secrets), 'build-site-data')
     _write_private_status_summary('private-status-after-pipeline', secrets)
 
 
